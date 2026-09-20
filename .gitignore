@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+export/
+archive/
+zips/
+_report.csv
+*.zip
