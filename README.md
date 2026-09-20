@@ -56,7 +56,7 @@ At [accounts.snapchat.com](https://accounts.snapchat.com) on desktop → **My Da
 3. Leave the date-range toggle **OFF** to get everything
 4. Confirm your email and submit
 
-Snapchat takes **up to 7 days** to generate it, and the download links **expire about 7 days** after that.
+Snapchat takes **up to 7 days** to generate it, but for my 7 GB it was an hour. The download links **expire about 7 days** after that.
 
 > **Download every ZIP listed.** A large library is split across several. Only the first (unnumbered) one contains the `json/` folder. Take only that one and you get dates without most photos; skip it and you get photos with no dates.
 
