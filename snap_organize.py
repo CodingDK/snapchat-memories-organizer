@@ -39,11 +39,17 @@ PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".avi"}
 OVERLAY_RE = re.compile(r"[-_]overlay$", re.I)
 MAIN_RE = re.compile(r"[-_](main|media)$", re.I)
+# A full datetime in the filename is only trusted when the seconds are not
+# followed by more letters or digits. Snapchat names are DATE_UUID, and a UUID
+# that happens to begin with digits (2019-05-04_18304522-...) would otherwise
+# read as 18:30:45 and send the matcher hunting around a time that never was.
 FNAME_DT_RES = [
-    re.compile(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})[ _T]+(\d{2})[-_:]?(\d{2})[-_:]?(\d{2})"),
+    re.compile(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})[ _T]+(\d{2})[-_:]?(\d{2})[-_:]?(\d{2})"
+               r"(?![0-9A-Za-z])"),
     re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})"),
 ]
-MATCH_TOLERANCE = timedelta(seconds=90)
+MATCH_TOLERANCE = timedelta(seconds=90)   # exact match
+LOOSE_TOLERANCE = timedelta(days=1)       # fallback, only if the filename date agrees
 
 PRINT_LOCK = Lock()
 
@@ -334,15 +340,21 @@ def match_pairs(entries, pairs):
     times = [e.dt_utc for e in free]
 
     def nearest(target, skip_used=True):
+        """Closest entry to target. Walks outward from the insertion point by
+        TIME rather than a fixed number of slots, so a burst of many memories
+        saved in the same second cannot crowd the last one out of the window."""
         i = bisect_left(times, target)
         best, best_gap = None, None
-        for j in range(max(0, i - 4), min(len(free), i + 5)):
-            e = free[j]
-            if skip_used and e.used:
-                continue
-            gap = abs(e.dt_utc - target)
-            if best_gap is None or gap < best_gap:
-                best, best_gap = e, gap
+        for j0, stop, step in ((i - 1, -1, -1), (i, len(free), 1)):
+            for j in range(j0, stop, step):
+                e = free[j]
+                gap = abs(e.dt_utc - target)
+                if gap > LOOSE_TOLERANCE:
+                    break
+                if skip_used and e.used:
+                    continue
+                if best_gap is None or gap < best_gap:
+                    best, best_gap = e, gap
         return best, best_gap
 
     # A zip stores mtimes without a timezone, so the whole set can sit at a
@@ -378,7 +390,7 @@ def match_pairs(entries, pairs):
             continue
         if best_gap <= MATCH_TOLERANCE:
             best.used, pr.entry = True, best
-        elif best_gap <= timedelta(days=1):
+        elif best_gap <= LOOSE_TOLERANCE:
             # Looser fallback, but only if the filename's date agrees with it.
             if pr.day_hint is None or pr.day_hint == best.dt_utc.date():
                 best.used, pr.entry, pr.key_src = True, best, "mtime-loose"
@@ -436,9 +448,11 @@ def video_meta_args(dt_utc, lat, lon):
             "creation_time=" + dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000000Z")]
     if lat is not None and lon is not None:
         iso = "%+08.4f%+09.4f/" % (lat, lon)
+        # ffmpeg writes these as the (c)xyz / loci atoms, the de-facto MP4
+        # location tags. (A com.apple.quicktime.* key would be silently
+        # dropped without -movflags use_metadata_tags, so none is passed.)
         args += ["-metadata", "location=" + iso,
-                 "-metadata", "location-eng=" + iso,
-                 "-metadata", "com.apple.quicktime.location.ISO6709=" + iso]
+                 "-metadata", "location-eng=" + iso]
     return args
 
 
@@ -587,7 +601,9 @@ def process_one(pr, out_root, opts, name):
     # ---- clean original
     try:
         if not (orig_path.exists() and not opts.force):
-            if is_video:
+            if opts.raw_originals:
+                shutil.copy2(pr.main, orig_path)      # byte-exact, nothing embedded
+            elif is_video:
                 copy_video_with_meta(pr.main, orig_path, meta)
             else:
                 shutil.copy2(pr.main, orig_path)
@@ -600,6 +616,9 @@ def process_one(pr, out_root, opts, name):
     # ---- merged (overlay burned in)
     try:
         if merged_path.exists() and not opts.force:
+            # Resumed run: this file was made earlier. Say so rather than
+            # claiming "ok" for work this run did not do or check.
+            row["status"] = "present"
             return row
         if pr.overlay is None:
             # nothing to burn in: the merged copy is the original
@@ -878,6 +897,9 @@ def main():
     pr.add_argument("--jobs", type=int, default=max(2, (os.cpu_count() or 4) // 2))
     pr.add_argument("--crf", type=int, default=18, help="video quality, lower is better")
     pr.add_argument("--quality", type=int, default=95, help="JPEG quality")
+    pr.add_argument("--raw-originals", action="store_true",
+                    help="Originals/ are byte-exact copies of the export "
+                         "(no embedded date/GPS; file timestamps still set)")
     pr.add_argument("--tz", default=None,
                     help="timezone for dates, e.g. America/New_York (default: this PC)")
     pr.add_argument("--utc", action="store_true", help="name files in UTC instead")
@@ -891,7 +913,12 @@ def main():
         tzinfo, tzname = timezone.utc, "UTC"
     elif getattr(args, "tz", None):
         from zoneinfo import ZoneInfo
-        tzinfo, tzname = ZoneInfo(args.tz), args.tz
+        try:
+            tzinfo, tzname = ZoneInfo(args.tz), args.tz
+        except Exception as e:
+            log("Unknown timezone %r (%s)." % (args.tz, type(e).__name__))
+            log("Windows has no built-in IANA database:  pip install tzdata")
+            return 2
     args.tzinfo, args.tzname = tzinfo, tzname
 
     if args.cmd == "extract":

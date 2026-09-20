@@ -41,6 +41,7 @@ This tool rebuilds the connection and produces something you'd actually want to 
 
 ```bash
 pip install Pillow piexif
+pip install tzdata      # Windows only, and only if you use --tz (no built-in IANA database)
 ```
 
 Developed and verified on Windows 11 against a real 2,793-memory export. The code is cross-platform; on macOS/Linux everything works except setting the file *Created* date, which is a Windows-only concept (Modified is still set).
@@ -56,7 +57,7 @@ At [accounts.snapchat.com](https://accounts.snapchat.com) on desktop → **My Da
 3. Leave the date-range toggle **OFF** to get everything
 4. Confirm your email and submit
 
-Snapchat takes **up to 7 days** to generate it, but for my 7 GB it was an hour. The download links **expire about 7 days** after that.
+Snapchat says it can take **up to 7 days** to generate it, but for my 7 GB it was an hour. Snapchat does not publish a link expiry; community reports put it at **about 7 days**, so download promptly.
 
 > **Download every ZIP listed.** A large library is split across several. Only the first (unnumbered) one contains the `json/` folder. Take only that one and you get dates without most photos; skip it and you get photos with no dates.
 
@@ -78,10 +79,11 @@ python snap_organize.py run ./export ./archive
 **Read the `inspect` output before running.** The line that matters:
 
 ```
-Match test: 2792 / 2793 media matched to a JSON entry
+Match test: 2793 / 2793 media matched to a JSON entry
+   via mtime        2793
 ```
 
-That ratio should be near 100%. If it is low, **stop** — almost always a ZIP that was never extracted. Running anyway produces an archive dated from file timestamps alone, which is much less trustworthy.
+That ratio should be near 100%, and on a Snapchat export the matches should all be `mtime`. If it is low, **stop** — almost always a ZIP that was never extracted. Running anyway produces an archive dated from file timestamps alone, which is much less trustworthy.
 
 `run` is resumable and skips files that already exist, so if it is interrupted just run it again. Use `--force` to rebuild regardless.
 
@@ -97,6 +99,7 @@ That ratio should be near 100%. If it is low, **stop** — almost always a ZIP t
 | `--utc` | Name files in UTC |
 | `--crf 16` | Better video quality, bigger files (default 18) |
 | `--quality 95` | JPEG quality for merged photos |
+| `--raw-originals` | `Originals/` are byte-exact copies of the export (no embedded date/GPS; file timestamps still set) |
 
 ---
 
@@ -180,11 +183,22 @@ Give collisions a `_2`, `_3` suffix. Several popular scripts overwrite here and 
 - **Orphan overlays** — a caption layer with no base media. Keep it rather than crash.
 - **JSON rows with no media file** — 186 of 2,978 in the real export. Memories deleted from the account long ago, metadata row left behind. Not a bug, and not recoverable. Say so plainly rather than quietly dropping them.
 
-### 8. Odds and ends
+### 8. The matcher can be fooled by digits and bursts
+
+Two bugs found only by auditing every row of `_report.csv`, not by looking at output:
+
+- **A UUID that starts with digits looks like a time.** `2019-05-04_18304522-…` was parsed as 18:30:45. The matcher then searched around a time that never existed, pushed one clip onto a *deleted* memory's row 22 hours away, and swapped the names of two others. Only trust a time-of-day in a filename when it is not followed by more letters or digits.
+- **A fixed-size search window starves a burst.** Searching ±4 rows around the insertion point works until seven clips share one second; the last one finds every neighbour already taken and goes unmatched. Walk outward by *time*, not by row count.
+
+On a Snapchat export the `matched` column of `_report.csv` should be essentially all `mtime`. More than a handful of `mtime-loose` or `NO-JSON-MATCH` means one of these is back.
+
+### 9. Odds and ends
 
 - A few overlays are a slightly different shape than the photo (828×1548 over 960×1700). Scale-to-cover and centre-crop; stretching visibly widens the text.
 - `memories.html` appears in **every** ZIP with different content, so file counts across ZIPs won't match the extracted total. Not data loss.
 - ZIP mtimes have no timezone and can sit at a constant offset. The matcher measures a candidate shift and **keeps it only if it actually improves the match count**.
+- Some overlays are **fully transparent** — a ~2 KB WebP with alpha 0 everywhere, exported for a snap that had no caption. The merged file is then (correctly) identical to the original. A caption-visibility check will flag these; look at the overlay's alpha channel before concluding the composite failed. Two of 703 in the real export.
+- Stream-copying originals is a remux: frames and audio are untouched, but the container is rewritten. A source whose own headers disagree (one in 2,793 here: a 0.5 s video stream with 3.5 s of audio) can report a different length afterwards. `--raw-originals` sidesteps this entirely.
 
 ---
 
@@ -194,10 +208,12 @@ Do not trust a "0 errors" summary. It only means nothing threw.
 
 **Automated:**
 
-- Every merged file has a twin in `Originals/`, and for captioned memories the two must **differ** (pixel-diff). Identical means the caption never got applied.
+- Every merged file has a twin in `Originals/`. For captioned memories, diff the two (first frame, for video). A caption is a **large** delta (max channel difference well over 100); a plain JPEG/H.264 re-encode is small noise everywhere (under ~40). Identical pixels means the caption never got applied (or the overlay itself is empty — check its alpha channel) — but a mere difference does **not** prove it did, so threshold it, don't just test for "any difference".
 - For captioned videos, the output frame's aspect ratio should match the overlay's — catches landmine #2.
 - **Each file's modification time should equal the time in its own filename.** This is what catches landmine #3, and nothing else does.
-- Spot-check EXIF `DateTimeOriginal` and GPS against `_report.csv`.
+- Every original video should display at the same dimensions as its source — confirms the rotation flag survived the remux.
+- Read the `matched` column of `_report.csv`, every row — this is what catches landmine #8. Then look at each non-exact row's source file and ask why.
+- Check EXIF `DateTimeOriginal` and GPS against `_report.csv` — for every photo, not a sample; it's a few seconds.
 
 **By eye — have the person check both ends of the timeline:**
 
@@ -218,6 +234,8 @@ Do not trust a "0 errors" summary. It only means nothing threw.
 | Dates an hour off for part of the year | Fixed UTC offset instead of DST-aware (landmine #3) |
 | "no memories_history.json found" | The unnumbered ZIP wasn't extracted, or "Export JSON files" was off when requesting |
 | Photos with no caption applied | Check `_report.csv` `has_overlay` — the export may genuinely have no overlay |
+| `--tz` fails with `ZoneInfoNotFoundError` | Windows has no IANA database: `pip install tzdata` |
+| A few `mtime-loose` / `NO-JSON-MATCH` rows | Landmine #8 — inspect those rows' source filenames |
 
 ---
 
